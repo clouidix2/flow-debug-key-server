@@ -1,0 +1,15 @@
+{
+  "name": "flow-debug-key-bot",
+  "version": "1.0.0",
+  "description": "Discord bot for generating/terminating Flow Debug license keys",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.3"
+  }
+}
