@@ -3,6 +3,7 @@
 // Slash commands:
 //   /flowkey generate @user plan:<Lifetime|Monthly>
 //   /flowkey terminate @user reason:<text>
+//   /flowkey help                              (public - shows DM setup instructions)
 //
 // Requires Node 18+ (built-in fetch). Run "npm install" then "npm start".
 //
@@ -12,7 +13,9 @@
 //   DISCORD_GUILD_ID  - (optional) guild ID for instant command registration
 //   KEY_SERVER_URL    - public URL of your key server
 //   BOT_SECRET        - must match the BOT_SECRET set on the key server
-//   ALLOWED_ROLE_ID   - (optional) Discord role ID required to use /flowkey
+//   ALLOWED_ROLE_ID   - (optional) Discord role ID required to use /flowkey generate/terminate.
+//                       /flowkey help is intentionally NOT gated by this - anyone can use it,
+//                       since it's just instructions, meant to be postable in support tickets.
 
 const {
     Client,
@@ -64,6 +67,16 @@ async function dmUser(user, content) {
     }
 }
 
+const HELP_MESSAGE =
+    ":envelope_with_arrow: **How to enable DMs so I can send you your key**\n\n" +
+    "1. Open Discord's **User Settings** (gear icon near your name).\n" +
+    "2. Go to **Privacy & Safety**.\n" +
+    "3. Turn on **\"Allow direct messages from server members\"** for this server.\n" +
+    "   - On mobile: Settings → Privacy & Safety → same toggle.\n" +
+    "4. If you'd previously blocked the bot by accident, make sure it isn't in your **Blocked Users** list.\n" +
+    "5. Ask a staff member to run `/flowkey generate` for you again once DMs are enabled.\n\n" +
+    "If DMs are already on and you still aren't receiving anything, mutual servers or account age restrictions can sometimes block bot DMs - let staff know and they can send the key another way.";
+
 const flowkeyCommand = new SlashCommandBuilder()
     .setName("flowkey")
     .setDescription("Manage Flow Debug license keys")
@@ -104,6 +117,11 @@ const flowkeyCommand = new SlashCommandBuilder()
                     .setDescription("Reason for termination")
                     .setRequired(true)
             )
+    )
+    .addSubcommand((sub) =>
+        sub
+            .setName("help")
+            .setDescription("Shows instructions for enabling DMs (postable in support tickets)")
     );
 
 async function registerCommands() {
@@ -129,11 +147,17 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "This command only works in servers.", flags: MessageFlags.Ephemeral });
     }
 
+    const sub = interaction.options.getSubcommand();
+
+    // "help" is intentionally public and NOT role-gated - anyone can post it,
+    // e.g. staff pasting it into a support ticket for a user with DMs off.
+    if (sub === "help") {
+        return interaction.reply({ content: HELP_MESSAGE }); // no ephemeral flag - visible to the whole channel
+    }
+
     if (ALLOWED_ROLE_ID && !interaction.member?.roles?.cache?.has(ALLOWED_ROLE_ID)) {
         return interaction.reply({ content: "You don't have permission to use this.", flags: MessageFlags.Ephemeral });
     }
-
-    const sub = interaction.options.getSubcommand();
 
     try {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -164,14 +188,12 @@ client.on("interactionCreate", async (interaction) => {
                 return interaction.editReply(`Failed to generate key: ${data.error || "server error"}`);
             }
 
-            // Cache the key so terminate can show it struck-through later
             keyCache.set(targetUser.id, {
                 key: data.key,
                 plan,
                 generatedAt: Date.now(),
             });
 
-            // DM the target user
             const dmContent =
                 `:closed_lock_with_key: **Flow Addon License Key**\n\n` +
                 `**Your personal key:**\n\`\`\`\n${data.key}\n\`\`\`\n` +
@@ -189,7 +211,7 @@ client.on("interactionCreate", async (interaction) => {
                 `Plan: \`${plan}\`\n` +
                 `Key: \`${data.key}\`\n` +
                 `Expires: ${expiryText}\n` +
-                `DM sent: ${dmSent ? "✅" : "❌ (user has DMs closed)"}`
+                `DM sent: ${dmSent ? "✅" : "❌ (user has DMs closed - use /flowkey help in this channel to guide them)"}`
             );
         }
 
@@ -213,7 +235,6 @@ client.on("interactionCreate", async (interaction) => {
                 return interaction.editReply(`Failed to terminate: ${data.error || "server error"}`);
             }
 
-            // Build DM content with struck-through key if cached
             let dmContent = `:closed_lock_with_key: **Flow Addon License Key**\n\n**Your Personal key has been terminated**\n`;
             if (cached) {
                 dmContent += `\`\`\`\n~~${cached.key}~~\n\`\`\`\n`;
@@ -225,7 +246,6 @@ client.on("interactionCreate", async (interaction) => {
 
             const dmSent = await dmUser(targetUser, dmContent);
 
-            // Purge from cache
             keyCache.delete(targetUser.id);
 
             return interaction.editReply(
