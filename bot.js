@@ -1,9 +1,15 @@
 // Flow Debug key-generation Discord bot
 //
-// Slash commands:
+// Slash commands (all require the ALLOWED_ROLE_ID role, including help):
 //   /flowkey generate @user plan:<Lifetime|Monthly>
 //   /flowkey terminate @user reason:<text>
-//   /flowkey help                              (public - shows DM setup instructions)
+//   /flowkey upgrade @user
+//   /flowkey check @user
+//   /flowkey help
+//
+// Background job: every 15 minutes, checks for monthly keys that were
+// generated 7+ days ago and never activated (boundDeviceId still null),
+// revokes them, and DMs the user that their key was terminated for non-use.
 //
 // Requires Node 18+ (built-in fetch). Run "npm install" then "npm start".
 //
@@ -13,8 +19,7 @@
 //   DISCORD_GUILD_ID  - (optional) guild ID for instant command registration
 //   KEY_SERVER_URL    - public URL of your key server
 //   BOT_SECRET        - must match the BOT_SECRET set on the key server
-//   ALLOWED_ROLE_ID   - (optional) Discord role ID required to use any /flowkey subcommand,
-//                       including help.
+//   ALLOWED_ROLE_ID   - (optional) Discord role ID required to use any /flowkey subcommand
 
 const {
     Client,
@@ -28,32 +33,40 @@ const {
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const GUILD_ID = process.env.DISCORD_GUILD_ID;
-const API_URL = process.env.KEY_SERVER_URL;
 const BOT_SECRET = process.env.BOT_SECRET;
 const ALLOWED_ROLE_ID = process.env.ALLOWED_ROLE_ID;
+
+// Normalize KEY_SERVER_URL so a bare domain (missing "https://") doesn't
+// silently break every fetch() call with a confusing "Failed to parse URL" error.
+let API_URL = process.env.KEY_SERVER_URL;
+if (API_URL && !/^https?:\/\//i.test(API_URL)) {
+    console.warn(`KEY_SERVER_URL "${API_URL}" is missing a protocol - assuming https://`);
+    API_URL = `https://${API_URL}`;
+}
+if (API_URL) {
+    API_URL = API_URL.replace(/\/+$/, ""); // strip any trailing slash too, same reasoning
+}
 
 if (!TOKEN || !CLIENT_ID || !API_URL || !BOT_SECRET) {
     console.error("Missing required environment variables. Need DISCORD_TOKEN, DISCORD_CLIENT_ID, KEY_SERVER_URL, BOT_SECRET.");
     process.exit(1);
 }
 
-// In-memory cache: discordUserId -> { key, plan, generatedAt }
-// Persists only while bot is running. If you restart, cache clears.
-const keyCache = new Map();
+const UNUSED_KEY_SWEEP_INTERVAL_MS = 15 * 60 * 1000; // check every 15 minutes
+const UNUSED_KEY_GRACE_PERIOD_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-// Helper: fetch with timeout so we never hang forever
+// ---------- helpers ----------
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeoutMs);
     try {
-        const res = await fetch(url, { ...options, signal: controller.signal });
-        return res;
+        return await fetch(url, { ...options, signal: controller.signal });
     } finally {
         clearTimeout(id);
     }
 }
 
-// Helper: DM a user, handle closed DMs gracefully
 async function dmUser(user, content) {
     try {
         return await user.send(content);
@@ -66,6 +79,56 @@ async function dmUser(user, content) {
     }
 }
 
+async function apiPost(pathName, body) {
+    const res = await fetchWithTimeout(`${API_URL}${pathName}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-bot-secret": BOT_SECRET },
+        body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    return { ok: res.ok, data };
+}
+
+async function apiGet(pathName) {
+    const res = await fetchWithTimeout(`${API_URL}${pathName}`, {
+        headers: { "x-bot-secret": BOT_SECRET },
+    });
+    const data = await res.json();
+    return { ok: res.ok, data };
+}
+
+// Formats a millisecond duration as e.g. "13d 12h", "2h", "27d 5h", "45m"
+function formatTimeframe(ms) {
+    if (ms <= 0) return "0m";
+
+    const totalMinutes = Math.floor(ms / (60 * 1000));
+    const days = Math.floor(totalMinutes / (24 * 60));
+    const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+    const minutes = totalMinutes % 60;
+
+    if (days > 0) {
+        return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+    }
+    if (hours > 0) {
+        return minutes > 0 && hours < 1 ? `${hours}h ${minutes}m` : `${hours}h`;
+    }
+    return `${minutes}m`;
+}
+
+function buildKeyDm({ key, plan, expiresAt }) {
+    const planBlock = plan === "lifetime"
+        ? "Lifetime"
+        : `Monthly - expires in ${formatTimeframe(expiresAt - Date.now())}`;
+
+    return (
+        `:closed_lock_with_key: **Flow Addon License Key**\n\n` +
+        `**Your personal key:**\n\`\`\`\n${key}\n\`\`\`\n` +
+        `**Plan**\n\`\`\`\n${planBlock}\n\`\`\`\n` +
+        `**To activate in-game:**\n\`\`\`\nGoto the Flow Key Module and input key. Then activate the module.\n\`\`\`\n` +
+        `> :warning: Do not share this key. It is tied to your HWID and can be revoked at any time.`
+    );
+}
+
 const HELP_MESSAGE =
     ":envelope_with_arrow: **How to enable DMs so I can send you your key**\n\n" +
     "1. Open Discord's **User Settings** (gear icon near your name).\n" +
@@ -76,6 +139,8 @@ const HELP_MESSAGE =
     "5. Ask a staff member to run `/flowkey generate` for you again once DMs are enabled.\n\n" +
     "If DMs are already on and you still aren't receiving anything, mutual servers or account age restrictions can sometimes block bot DMs - let staff know and they can send the key another way.";
 
+// ---------- slash command definitions ----------
+
 const flowkeyCommand = new SlashCommandBuilder()
     .setName("flowkey")
     .setDescription("Manage Flow Debug license keys")
@@ -83,12 +148,7 @@ const flowkeyCommand = new SlashCommandBuilder()
         sub
             .setName("generate")
             .setDescription("Generate a license key for a user")
-            .addUserOption((opt) =>
-                opt
-                    .setName("user")
-                    .setDescription("The user to generate a key for")
-                    .setRequired(true)
-            )
+            .addUserOption((opt) => opt.setName("user").setDescription("The user to generate a key for").setRequired(true))
             .addStringOption((opt) =>
                 opt
                     .setName("plan")
@@ -104,34 +164,29 @@ const flowkeyCommand = new SlashCommandBuilder()
         sub
             .setName("terminate")
             .setDescription("Terminate a user's license key")
-            .addUserOption((opt) =>
-                opt
-                    .setName("user")
-                    .setDescription("The user whose key to terminate")
-                    .setRequired(true)
-            )
-            .addStringOption((opt) =>
-                opt
-                    .setName("reason")
-                    .setDescription("Reason for termination")
-                    .setRequired(true)
-            )
+            .addUserOption((opt) => opt.setName("user").setDescription("The user whose key to terminate").setRequired(true))
+            .addStringOption((opt) => opt.setName("reason").setDescription("Reason for termination").setRequired(true))
     )
     .addSubcommand((sub) =>
         sub
-            .setName("help")
-            .setDescription("Shows instructions for enabling DMs (postable in support tickets)")
-    );
+            .setName("upgrade")
+            .setDescription("Upgrade a user's monthly key to a lifetime key")
+            .addUserOption((opt) => opt.setName("user").setDescription("The user to upgrade").setRequired(true))
+    )
+    .addSubcommand((sub) =>
+        sub
+            .setName("check")
+            .setDescription("Check a user's current license status")
+            .addUserOption((opt) => opt.setName("user").setDescription("The user to check").setRequired(true))
+    )
+    .addSubcommand((sub) => sub.setName("help").setDescription("Shows instructions for enabling DMs (postable in support tickets)"));
 
 async function registerCommands() {
     const rest = new REST({ version: "10" }).setToken(TOKEN);
     const body = [flowkeyCommand.toJSON()];
 
-    // Always wipe BOTH the global and guild command registries first. Discord
-    // keeps these as two entirely separate lists - if a past deploy ever ran
-    // with a different GUILD_ID setting than the current one, stale duplicate
-    // commands would otherwise linger forever, since changing the code doesn't
-    // remove commands registered under the old mode.
+    // Wipe both registries first so stale commands from earlier deploys (under
+    // a different GUILD_ID setting) can never linger as duplicates.
     await rest.put(Routes.applicationCommands(CLIENT_ID), { body: [] });
     if (GUILD_ID) {
         await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: [] });
@@ -156,17 +211,14 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "This command only works in servers.", flags: MessageFlags.Ephemeral });
     }
 
-    const sub = interaction.options.getSubcommand();
-
     if (ALLOWED_ROLE_ID && !interaction.member?.roles?.cache?.has(ALLOWED_ROLE_ID)) {
         return interaction.reply({ content: "You don't have permission to use this.", flags: MessageFlags.Ephemeral });
     }
 
-    // "help" still replies publicly (visible to the whole channel) since the
-    // point is being able to post it for a user to read in a ticket - it's
-    // just no longer usable by people without the allowed role.
+    const sub = interaction.options.getSubcommand();
+
     if (sub === "help") {
-        return interaction.reply({ content: HELP_MESSAGE }); // no ephemeral flag - visible to the whole channel
+        return interaction.reply({ content: HELP_MESSAGE }); // public - visible to the whole channel
     }
 
     try {
@@ -179,46 +231,27 @@ client.on("interactionCreate", async (interaction) => {
     try {
         if (sub === "generate") {
             const targetUser = interaction.options.getUser("user", true);
-            const plan = interaction.options.getString("plan", true);
-            const duration = plan; // "forever" or "1month"
+            const plan = interaction.options.getString("plan", true); // "forever" or "1month"
 
-            const res = await fetchWithTimeout(`${API_URL}/keys/generate`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json", "x-bot-secret": BOT_SECRET },
-                body: JSON.stringify({
-                    discordUserId: targetUser.id,
-                    nickname: targetUser.username,
-                    duration,
-                }),
+            const { ok, data } = await apiPost("/keys/generate", {
+                discordUserId: targetUser.id,
+                nickname: targetUser.username,
+                duration: plan,
             });
 
-            const data = await res.json();
-
-            if (!res.ok) {
+            if (!ok) {
                 return interaction.editReply(`Failed to generate key: ${data.error || "server error"}`);
             }
 
-            keyCache.set(targetUser.id, {
-                key: data.key,
-                plan,
-                generatedAt: Date.now(),
-            });
-
-            const dmContent =
-                `:closed_lock_with_key: **Flow Addon License Key**\n\n` +
-                `**Your personal key:**\n\`\`\`\n${data.key}\n\`\`\`\n` +
-                `**To activate in-game:**\n\`\`\`\nGoto the Flow Key module and input the key\n\`\`\`\n` +
-                `> :warning: Do not share this key. It is tied to your HWID and can be revoked at any time.`;
-
+            const planName = plan === "forever" ? "lifetime" : "monthly";
+            const dmContent = buildKeyDm({ key: data.key, plan: planName, expiresAt: data.expiresAt });
             const dmSent = await dmUser(targetUser, dmContent);
 
-            const expiryText = data.expiresAt
-                ? `<t:${Math.floor(data.expiresAt / 1000)}:F>`
-                : "Never (permanent)";
+            const expiryText = data.expiresAt ? `<t:${Math.floor(data.expiresAt / 1000)}:F>` : "Never (permanent)";
 
             return interaction.editReply(
                 `✅ **Key generated for ${targetUser}**\n` +
-                `Plan: \`${plan}\`\n` +
+                `Plan: \`${planName}\`\n` +
                 `Key: \`${data.key}\`\n` +
                 `Expires: ${expiryText}\n` +
                 `DM sent: ${dmSent ? "✅" : "❌ (user has DMs closed - use /flowkey help in this channel to guide them)"}`
@@ -228,41 +261,93 @@ client.on("interactionCreate", async (interaction) => {
         if (sub === "terminate") {
             const targetUser = interaction.options.getUser("user", true);
             const reason = interaction.options.getString("reason", true);
-            const cached = keyCache.get(targetUser.id);
 
-            const res = await fetchWithTimeout(`${API_URL}/keys/terminate`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json", "x-bot-secret": BOT_SECRET },
-                body: JSON.stringify({
-                    discordUserId: targetUser.id,
-                    nickname: targetUser.username,
-                }),
+            const status = await apiGet(`/keys/status/${targetUser.id}`);
+            if (!status.ok || !status.data.hasValidKey) {
+                return interaction.editReply(`User doesn't have a valid license key`);
+            }
+
+            const { ok, data } = await apiPost("/keys/terminate", {
+                discordUserId: targetUser.id,
+                nickname: targetUser.username,
             });
 
-            const data = await res.json();
-
-            if (!res.ok) {
+            if (!ok) {
                 return interaction.editReply(`Failed to terminate: ${data.error || "server error"}`);
             }
 
-            let dmContent = `:closed_lock_with_key: **Flow Addon License Key**\n\n**Your Personal key has been terminated**\n`;
-            if (cached) {
-                dmContent += `\`\`\`\n~~${cached.key}~~\n\`\`\`\n`;
-            } else {
-                dmContent += `\`\`\`\nKey no longer available\n\`\`\`\n`;
-            }
-            dmContent += `**Reason**\n\`\`\`\n${reason}\n\`\`\`\n`;
-            dmContent += `> :warning: If you think this is wrong please open a support ticket in our discord`;
+            const dmContent =
+                `:closed_lock_with_key: **Flow Addon License Key**\n\n**Your Personal key has been terminated**\n` +
+                `\`\`\`\n~~${status.data.key}~~\n\`\`\`\n` +
+                `**Reason**\n\`\`\`\n${reason}\n\`\`\`\n` +
+                `> :warning: If you think this is wrong please open a support ticket in our discord`;
 
             const dmSent = await dmUser(targetUser, dmContent);
-
-            keyCache.delete(targetUser.id);
 
             return interaction.editReply(
                 `🔒 **Terminated ${data.revokedCount || 0} key(s) for ${targetUser}**\n` +
                 `Reason: \`${reason}\`\n` +
                 `DM sent: ${dmSent ? "✅" : "❌ (user has DMs closed)"}`
             );
+        }
+
+        if (sub === "upgrade") {
+            const targetUser = interaction.options.getUser("user", true);
+
+            const status = await apiGet(`/keys/status/${targetUser.id}`);
+            if (!status.ok) {
+                return interaction.editReply("Failed to look up user's key status.");
+            }
+
+            if (!status.data.hasValidKey) {
+                return interaction.editReply("User doesn't have a valid license key to upgrade.");
+            }
+
+            if (status.data.plan === "lifetime") {
+                return interaction.editReply("User already has a valid lifetime key.");
+            }
+
+            // Revoke the old monthly key, issue a fresh lifetime one.
+            await apiPost("/keys/revoke-by-key", { key: status.data.key });
+
+            const { ok, data } = await apiPost("/keys/generate", {
+                discordUserId: targetUser.id,
+                nickname: targetUser.username,
+                duration: "forever",
+            });
+
+            if (!ok) {
+                return interaction.editReply(`Failed to generate upgraded key: ${data.error || "server error"}`);
+            }
+
+            const dmContent = buildKeyDm({ key: data.key, plan: "lifetime", expiresAt: null });
+            const dmSent = await dmUser(targetUser, dmContent);
+
+            return interaction.editReply(
+                `✅ **Upgraded ${targetUser} to lifetime**\n` +
+                `New key: \`${data.key}\`\n` +
+                `DM sent: ${dmSent ? "✅" : "❌ (user has DMs closed - use /flowkey help in this channel to guide them)"}`
+            );
+        }
+
+        if (sub === "check") {
+            const targetUser = interaction.options.getUser("user", true);
+
+            const status = await apiGet(`/keys/status/${targetUser.id}`);
+            if (!status.ok) {
+                return interaction.editReply("Failed to look up user's key status.");
+            }
+
+            if (!status.data.hasValidKey) {
+                return interaction.editReply(`${targetUser} has no valid license :x:`);
+            }
+
+            if (status.data.plan === "lifetime") {
+                return interaction.editReply(`${targetUser} has a valid lifetime license`);
+            }
+
+            const timeLeft = formatTimeframe(status.data.expiresAt - Date.now());
+            return interaction.editReply(`${targetUser} has a valid monthly license. Expires in ${timeLeft}`);
         }
     } catch (e) {
         console.error("Command error:", e);
@@ -275,7 +360,52 @@ client.on("interactionCreate", async (interaction) => {
     }
 });
 
-client.once("ready", () => console.log(`Logged in as ${client.user.tag}`));
+// ---------- background sweep: revoke unused monthly keys after 7 days ----------
+
+async function sweepUnusedKeys() {
+    try {
+        const { ok, data } = await apiGet("/keys/list");
+        if (!ok) {
+            console.error("Sweep: failed to fetch key list");
+            return;
+        }
+
+        const now = Date.now();
+
+        for (const entry of data.keys) {
+            const isMonthly = entry.expiresAt !== null;
+            const neverUsed = !entry.boundDeviceId;
+            const oldEnough = now - entry.createdAt > UNUSED_KEY_GRACE_PERIOD_MS;
+
+            if (isMonthly && neverUsed && oldEnough && !entry.revoked) {
+                const revokeResult = await apiPost("/keys/revoke-by-key", { key: entry.key });
+                if (!revokeResult.ok || !revokeResult.data.revoked) continue;
+
+                if (entry.createdFor) {
+                    try {
+                        const user = await client.users.fetch(entry.createdFor);
+                        await dmUser(
+                            user,
+                            `<@${entry.createdFor}>. You have not used the license key within 7 days and the license has been terminated. Please make a support ticket in our discord`
+                        );
+                    } catch (e) {
+                        console.error(`Sweep: failed to notify user ${entry.createdFor}:`, e.message);
+                    }
+                }
+
+                console.log(`Sweep: revoked unused key ${entry.key} (createdFor: ${entry.createdFor})`);
+            }
+        }
+    } catch (e) {
+        console.error("Sweep error:", e);
+    }
+}
+
+client.once("ready", () => {
+    console.log(`Logged in as ${client.user.tag}`);
+    sweepUnusedKeys(); // run once on startup too, not just after the first interval
+    setInterval(sweepUnusedKeys, UNUSED_KEY_SWEEP_INTERVAL_MS);
+});
 
 registerCommands()
     .then(() => client.login(TOKEN))
