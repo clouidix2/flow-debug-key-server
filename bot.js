@@ -13,9 +13,8 @@
 //   DISCORD_GUILD_ID  - (optional) guild ID for instant command registration
 //   KEY_SERVER_URL    - public URL of your key server
 //   BOT_SECRET        - must match the BOT_SECRET set on the key server
-//   ALLOWED_ROLE_ID   - (optional) Discord role ID required to use /flowkey generate/terminate.
-//                       /flowkey help is intentionally NOT gated by this - anyone can use it,
-//                       since it's just instructions, meant to be postable in support tickets.
+//   ALLOWED_ROLE_ID   - (optional) Discord role ID required to use any /flowkey subcommand,
+//                       including help.
 
 const {
     Client,
@@ -128,12 +127,22 @@ async function registerCommands() {
     const rest = new REST({ version: "10" }).setToken(TOKEN);
     const body = [flowkeyCommand.toJSON()];
 
+    // Always wipe BOTH the global and guild command registries first. Discord
+    // keeps these as two entirely separate lists - if a past deploy ever ran
+    // with a different GUILD_ID setting than the current one, stale duplicate
+    // commands would otherwise linger forever, since changing the code doesn't
+    // remove commands registered under the old mode.
+    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: [] });
+    if (GUILD_ID) {
+        await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: [] });
+    }
+
     if (GUILD_ID) {
         await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body });
-        console.log("Registered /flowkey as a guild command (instant).");
+        console.log("Cleared old commands and registered /flowkey as a guild command (instant).");
     } else {
         await rest.put(Routes.applicationCommands(CLIENT_ID), { body });
-        console.log("Registered /flowkey as a global command (can take up to an hour to show up).");
+        console.log("Cleared old commands and registered /flowkey as a global command (can take up to an hour to show up).");
     }
 }
 
@@ -149,14 +158,15 @@ client.on("interactionCreate", async (interaction) => {
 
     const sub = interaction.options.getSubcommand();
 
-    // "help" is intentionally public and NOT role-gated - anyone can post it,
-    // e.g. staff pasting it into a support ticket for a user with DMs off.
-    if (sub === "help") {
-        return interaction.reply({ content: HELP_MESSAGE }); // no ephemeral flag - visible to the whole channel
-    }
-
     if (ALLOWED_ROLE_ID && !interaction.member?.roles?.cache?.has(ALLOWED_ROLE_ID)) {
         return interaction.reply({ content: "You don't have permission to use this.", flags: MessageFlags.Ephemeral });
+    }
+
+    // "help" still replies publicly (visible to the whole channel) since the
+    // point is being able to post it for a user to read in a ticket - it's
+    // just no longer usable by people without the allowed role.
+    if (sub === "help") {
+        return interaction.reply({ content: HELP_MESSAGE }); // no ephemeral flag - visible to the whole channel
     }
 
     try {
