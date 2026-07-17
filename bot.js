@@ -2,9 +2,10 @@
 //
 // Slash commands (all require the ALLOWED_ROLE_ID role, including help):
 //   /flowkey generate @user plan:<Lifetime|Monthly>
-//   /flowkey terminate @user reason:<text>
+//   /flowkey terminate [@user] [key:<string>] reason:<text>   (provide either user or key)
 //   /flowkey upgrade @user
 //   /flowkey check @user
+//   /flowkey list
 //   /flowkey help
 //
 // Background job: every 15 minutes, checks for monthly keys that were
@@ -164,9 +165,9 @@ const flowkeyCommand = new SlashCommandBuilder()
         sub
             .setName("terminate")
             .setDescription("Terminate a license key, by user or by the key itself")
+            .addStringOption((opt) => opt.setName("reason").setDescription("Reason for termination").setRequired(true))
             .addUserOption((opt) => opt.setName("user").setDescription("The user whose key to terminate").setRequired(false))
             .addStringOption((opt) => opt.setName("key").setDescription("The exact key string to terminate").setRequired(false))
-            .addStringOption((opt) => opt.setName("reason").setDescription("Reason for termination").setRequired(true))
     )
     .addSubcommand((sub) =>
         sub
