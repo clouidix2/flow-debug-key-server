@@ -1,11 +1,15 @@
 // Flow Debug key-generation Discord bot
 //
-// Slash commands (all require the ALLOWED_ROLE_ID role, including help):
+// Slash commands (require ALLOWED_ROLE_ID, except help and mykey which anyone can use):
 //   /flowkey generate @user plan:<Lifetime|Monthly>
 //   /flowkey terminate [@user] [key:<string>] reason:<text>   (provide either user or key)
 //   /flowkey upgrade @user
 //   /flowkey check @user
 //   /flowkey list
+//   /flowkey mykey                (public - checks your own status)
+//   /flowkey reset-hwid @user     (clears their HWID lock)
+//   /flowkey renew @user          (extends a monthly key by 30 more days)
+//   /flowkey stats                (aggregate counts)
 //   /flowkey help
 //
 // Background job: every 15 minutes, checks for monthly keys that were
@@ -21,6 +25,9 @@
 //   KEY_SERVER_URL    - public URL of your key server
 //   BOT_SECRET        - must match the BOT_SECRET set on the key server
 //   ALLOWED_ROLE_ID   - (optional) Discord role ID required to use any /flowkey subcommand
+//                       except help and mykey, which anyone can use
+//   LOG_CHANNEL_ID    - (optional) channel ID to post an audit log line to for every
+//                       generate/terminate/upgrade/reset-hwid/renew action
 
 const {
     Client,
@@ -36,6 +43,7 @@ const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const GUILD_ID = process.env.DISCORD_GUILD_ID;
 const BOT_SECRET = process.env.BOT_SECRET;
 const ALLOWED_ROLE_ID = process.env.ALLOWED_ROLE_ID;
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID; // optional - audit log channel for every action
 
 // Normalize KEY_SERVER_URL so a bare domain (missing "https://") doesn't
 // silently break every fetch() call with a confusing "Failed to parse URL" error.
@@ -96,6 +104,18 @@ async function apiGet(pathName) {
     });
     const data = await res.json();
     return { ok: res.ok, data };
+}
+
+// Posts a line to the audit log channel, if LOG_CHANNEL_ID is set. Never
+// throws - a logging failure shouldn't ever break the actual command.
+async function auditLog(content) {
+    if (!LOG_CHANNEL_ID) return;
+    try {
+        const channel = await client.channels.fetch(LOG_CHANNEL_ID);
+        if (channel) await channel.send({ content });
+    } catch (e) {
+        console.error("Failed to post to audit log channel:", e.message);
+    }
 }
 
 // Formats a millisecond duration as e.g. "13d 12h", "2h", "27d 5h", "45m"
@@ -182,6 +202,20 @@ const flowkeyCommand = new SlashCommandBuilder()
             .addUserOption((opt) => opt.setName("user").setDescription("The user to check").setRequired(true))
     )
     .addSubcommand((sub) => sub.setName("list").setDescription("List every key on record and its status"))
+    .addSubcommand((sub) => sub.setName("mykey").setDescription("Check your own license status (anyone can use this)"))
+    .addSubcommand((sub) =>
+        sub
+            .setName("reset-hwid")
+            .setDescription("Clear a user's HWID lock, e.g. after a new PC")
+            .addUserOption((opt) => opt.setName("user").setDescription("The user whose HWID lock to reset").setRequired(true))
+    )
+    .addSubcommand((sub) =>
+        sub
+            .setName("renew")
+            .setDescription("Extend a user's monthly key by another 30 days")
+            .addUserOption((opt) => opt.setName("user").setDescription("The user to renew").setRequired(true))
+    )
+    .addSubcommand((sub) => sub.setName("stats").setDescription("Show aggregate key statistics"))
     .addSubcommand((sub) => sub.setName("help").setDescription("Shows instructions for enabling DMs (postable in support tickets)"));
 
 async function registerCommands() {
@@ -214,11 +248,15 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "This command only works in servers.", flags: MessageFlags.Ephemeral });
     }
 
-    if (ALLOWED_ROLE_ID && !interaction.member?.roles?.cache?.has(ALLOWED_ROLE_ID)) {
+    const sub = interaction.options.getSubcommand();
+
+    // "help" and "mykey" are intentionally open to everyone - help is just
+    // instructions, mykey only ever shows you your own status.
+    const PUBLIC_SUBCOMMANDS = ["help", "mykey"];
+
+    if (!PUBLIC_SUBCOMMANDS.includes(sub) && ALLOWED_ROLE_ID && !interaction.member?.roles?.cache?.has(ALLOWED_ROLE_ID)) {
         return interaction.reply({ content: "You don't have permission to use this.", flags: MessageFlags.Ephemeral });
     }
-
-    const sub = interaction.options.getSubcommand();
 
     if (sub === "help") {
         return interaction.reply({ content: HELP_MESSAGE }); // public - visible to the whole channel
@@ -251,6 +289,8 @@ client.on("interactionCreate", async (interaction) => {
             const dmSent = await dmUser(targetUser, dmContent);
 
             const expiryText = data.expiresAt ? `<t:${Math.floor(data.expiresAt / 1000)}:F>` : "Never (permanent)";
+
+            auditLog(`🔑 **Generate** - ${interaction.user} generated a **${planName}** key for ${targetUser} (\`${data.key}\`)`);
 
             return interaction.editReply(
                 `✅ **Key generated for ${targetUser}**\n` +
@@ -300,6 +340,8 @@ client.on("interactionCreate", async (interaction) => {
                     }
                 }
 
+                auditLog(`🔒 **Terminate** - ${interaction.user} terminated key \`${targetKey}\` (owner: ${entry.createdFor ? `<@${entry.createdFor}>` : "unknown"}). Reason: ${reason}`);
+
                 return interaction.editReply(
                     `🔒 **Terminated key** \`${targetKey}\`\n` +
                     `Reason: \`${reason}\`\n` +
@@ -329,6 +371,8 @@ client.on("interactionCreate", async (interaction) => {
                 `> :warning: If you think this is wrong please open a support ticket in our discord`;
 
             const dmSent = await dmUser(targetUser, dmContent);
+
+            auditLog(`🔒 **Terminate** - ${interaction.user} terminated ${data.revokedCount || 0} key(s) for ${targetUser}. Reason: ${reason}`);
 
             return interaction.editReply(
                 `🔒 **Terminated ${data.revokedCount || 0} key(s) for ${targetUser}**\n` +
@@ -369,11 +413,97 @@ client.on("interactionCreate", async (interaction) => {
             const dmContent = buildKeyDm({ key: data.key, plan: "lifetime", expiresAt: null });
             const dmSent = await dmUser(targetUser, dmContent);
 
+            auditLog(`⬆️ **Upgrade** - ${interaction.user} upgraded ${targetUser} to lifetime (new key: \`${data.key}\`)`);
+
             return interaction.editReply(
                 `✅ **Upgraded ${targetUser} to lifetime**\n` +
                 `New key: \`${data.key}\`\n` +
                 `DM sent: ${dmSent ? "✅" : "❌ (user has DMs closed - use /flowkey help in this channel to guide them)"}`
             );
+        }
+
+        if (sub === "reset-hwid") {
+            const targetUser = interaction.options.getUser("user", true);
+
+            const { ok, data } = await apiPost("/keys/reset-hwid", { discordUserId: targetUser.id });
+
+            if (!ok) {
+                if (data.error === "no_valid_key") {
+                    return interaction.editReply(`${targetUser} doesn't have a valid license key.`);
+                }
+                return interaction.editReply(`Failed to reset HWID: ${data.error || "server error"}`);
+            }
+
+            auditLog(`🔧 **Reset HWID** - ${interaction.user} reset the HWID lock for ${targetUser} (key: \`${data.key}\`)`);
+
+            return interaction.editReply(`✅ Cleared the HWID lock for ${targetUser}'s key (\`${data.key}\`). They can now activate on a new device.`);
+        }
+
+        if (sub === "renew") {
+            const targetUser = interaction.options.getUser("user", true);
+
+            const { ok, data } = await apiPost("/keys/renew", { discordUserId: targetUser.id });
+
+            if (!ok) {
+                if (data.error === "no_valid_key") {
+                    return interaction.editReply(`${targetUser} doesn't have a valid license key.`);
+                }
+                if (data.error === "already_lifetime") {
+                    return interaction.editReply(`${targetUser} already has a lifetime key - nothing to renew.`);
+                }
+                return interaction.editReply(`Failed to renew: ${data.error || "server error"}`);
+            }
+
+            const expiryText = `<t:${Math.floor(data.expiresAt / 1000)}:F>`;
+
+            const dmContent =
+                `:closed_lock_with_key: **Flow Addon License Key**\n\n**Your key has been renewed for another 30 days**\n` +
+                `\`\`\`\n${data.key}\n\`\`\`\n` +
+                `New expiry: ${expiryText}`;
+            const dmSent = await dmUser(targetUser, dmContent);
+
+            auditLog(`🔄 **Renew** - ${interaction.user} renewed ${targetUser}'s key (\`${data.key}\`), new expiry ${expiryText}`);
+
+            return interaction.editReply(
+                `✅ **Renewed ${targetUser}'s key**\n` +
+                `New expiry: ${expiryText}\n` +
+                `DM sent: ${dmSent ? "✅" : "❌ (user has DMs closed)"}`
+            );
+        }
+
+        if (sub === "stats") {
+            const { ok, data } = await apiGet("/keys/stats");
+            if (!ok) {
+                return interaction.editReply("Failed to fetch stats.");
+            }
+
+            return interaction.editReply(
+                `**Flow Key Stats**\n` +
+                `Total keys on record: ${data.total}\n` +
+                `Valid lifetime: ${data.validLifetime}\n` +
+                `Valid monthly: ${data.validMonthly}\n` +
+                `Unused (never activated): ${data.unused}\n` +
+                `Expired: ${data.expired}\n` +
+                `Revoked: ${data.revoked}`
+            );
+        }
+
+        if (sub === "mykey") {
+            const status = await apiGet(`/keys/status/${interaction.user.id}`);
+            if (!status.ok) {
+                return interaction.editReply("Failed to look up your key status.");
+            }
+
+            if (!status.data.hasValidKey) {
+                return interaction.editReply(`You have no valid license :x:`);
+            }
+
+            if (status.data.plan === "lifetime") {
+                return interaction.editReply(`You have a valid lifetime license ✅`);
+            }
+
+            const timeLeft = formatTimeframe(status.data.expiresAt - Date.now());
+            return interaction.editReply(`You have a valid monthly license. Expires in ${timeLeft}`);
         }
 
         if (sub === "check") {
