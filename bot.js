@@ -163,8 +163,9 @@ const flowkeyCommand = new SlashCommandBuilder()
     .addSubcommand((sub) =>
         sub
             .setName("terminate")
-            .setDescription("Terminate a user's license key")
-            .addUserOption((opt) => opt.setName("user").setDescription("The user whose key to terminate").setRequired(true))
+            .setDescription("Terminate a license key, by user or by the key itself")
+            .addUserOption((opt) => opt.setName("user").setDescription("The user whose key to terminate").setRequired(false))
+            .addStringOption((opt) => opt.setName("key").setDescription("The exact key string to terminate").setRequired(false))
             .addStringOption((opt) => opt.setName("reason").setDescription("Reason for termination").setRequired(true))
     )
     .addSubcommand((sub) =>
@@ -179,6 +180,7 @@ const flowkeyCommand = new SlashCommandBuilder()
             .setDescription("Check a user's current license status")
             .addUserOption((opt) => opt.setName("user").setDescription("The user to check").setRequired(true))
     )
+    .addSubcommand((sub) => sub.setName("list").setDescription("List every key on record and its status"))
     .addSubcommand((sub) => sub.setName("help").setDescription("Shows instructions for enabling DMs (postable in support tickets)"));
 
 async function registerCommands() {
@@ -259,9 +261,52 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         if (sub === "terminate") {
-            const targetUser = interaction.options.getUser("user", true);
+            const targetUser = interaction.options.getUser("user", false);
+            const targetKey = interaction.options.getString("key", false);
             const reason = interaction.options.getString("reason", true);
 
+            if (!targetUser && !targetKey) {
+                return interaction.editReply("Provide either a user or a key to terminate.");
+            }
+
+            if (targetKey) {
+                // Key-mode: look up who it belongs to (if anyone) so we can DM them.
+                const list = await apiGet("/keys/list");
+                const entry = list.ok ? list.data.keys.find((k) => k.key === targetKey) : null;
+
+                if (!entry) {
+                    return interaction.editReply(`No key found matching \`${targetKey}\`.`);
+                }
+
+                const { ok, data } = await apiPost("/keys/revoke-by-key", { key: targetKey });
+
+                if (!ok || !data.revoked) {
+                    return interaction.editReply(`That key was already revoked or something went wrong.`);
+                }
+
+                let dmSent = null;
+                if (entry.createdFor) {
+                    try {
+                        const owner = await client.users.fetch(entry.createdFor);
+                        const dmContent =
+                            `:closed_lock_with_key: **Flow Addon License Key**\n\n**Your Personal key has been terminated**\n` +
+                            `\`\`\`\n~~${targetKey}~~\n\`\`\`\n` +
+                            `**Reason**\n\`\`\`\n${reason}\n\`\`\`\n` +
+                            `> :warning: If you think this is wrong please open a support ticket in our discord`;
+                        dmSent = await dmUser(owner, dmContent);
+                    } catch (e) {
+                        dmSent = null;
+                    }
+                }
+
+                return interaction.editReply(
+                    `🔒 **Terminated key** \`${targetKey}\`\n` +
+                    `Reason: \`${reason}\`\n` +
+                    `DM sent: ${dmSent ? "✅" : "❌ (no owner on record or DMs closed)"}`
+                );
+            }
+
+            // User-mode (original behavior)
             const status = await apiGet(`/keys/status/${targetUser.id}`);
             if (!status.ok || !status.data.hasValidKey) {
                 return interaction.editReply(`User doesn't have a valid license key`);
@@ -348,6 +393,45 @@ client.on("interactionCreate", async (interaction) => {
 
             const timeLeft = formatTimeframe(status.data.expiresAt - Date.now());
             return interaction.editReply(`${targetUser} has a valid monthly license. Expires in ${timeLeft}`);
+        }
+
+        if (sub === "list") {
+            const list = await apiGet("/keys/list");
+            if (!list.ok) {
+                return interaction.editReply("Failed to fetch key list.");
+            }
+
+            if (list.data.keys.length === 0) {
+                return interaction.editReply("Available Keys.\n\n(none on record)");
+            }
+
+            const lines = list.data.keys.map((entry) => {
+                const who = entry.createdFor ? `<@${entry.createdFor}>` : "Unknown";
+                const plan = entry.expiresAt === null ? "Lifetime" : "Monthly";
+                const hwidLinked = entry.boundDeviceId ? "Yes" : "No";
+                const revokedTag = entry.revoked ? " (revoked)" : "";
+                return `${who} ${plan} ${entry.key} ${hwidLinked}${revokedTag}`;
+            });
+
+            // Discord messages cap at 2000 chars - chunk into multiple replies if needed.
+            const header = "Available Keys.\n";
+            let chunks = [];
+            let current = header;
+
+            for (const line of lines) {
+                if ((current + line + "\n").length > 1900) {
+                    chunks.push(current);
+                    current = "";
+                }
+                current += line + "\n";
+            }
+            if (current.length > 0) chunks.push(current);
+
+            await interaction.editReply(chunks[0]);
+            for (let i = 1; i < chunks.length; i++) {
+                await interaction.followUp({ content: chunks[i], flags: MessageFlags.Ephemeral });
+            }
+            return;
         }
     } catch (e) {
         console.error("Command error:", e);
