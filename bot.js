@@ -532,16 +532,17 @@ client.on("interactionCreate", async (interaction) => {
                 return interaction.editReply("Failed to fetch key list.");
             }
 
-            if (list.data.keys.length === 0) {
+            const activeKeys = list.data.keys.filter((entry) => !entry.revoked);
+
+            if (activeKeys.length === 0) {
                 return interaction.editReply("Available Keys.\n\n(none on record)");
             }
 
-            const lines = list.data.keys.map((entry) => {
+            const lines = activeKeys.map((entry) => {
                 const who = entry.createdFor ? `<@${entry.createdFor}>` : "Unknown";
                 const plan = entry.expiresAt === null ? "Lifetime" : "Monthly";
                 const hwidLinked = entry.boundDeviceId ? "Yes" : "No";
-                const revokedTag = entry.revoked ? " (revoked)" : "";
-                return `${who} ${plan} ${entry.key} ${hwidLinked}${revokedTag}`;
+                return `${who} ${plan} ${entry.key} ${hwidLinked}`;
             });
 
             // Discord messages cap at 2000 chars - chunk into multiple replies if needed.
