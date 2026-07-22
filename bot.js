@@ -10,6 +10,7 @@
 //   /flowkey reset-hwid @user     (clears their HWID lock)
 //   /flowkey renew @user          (extends a monthly key by 30 more days)
 //   /flowkey stats                (aggregate counts)
+//   /flowkey message @user <text> [file]   (send a custom DM, optionally with an attachment)
 //   /flowkey help
 //
 // Background job: every 15 minutes, checks for monthly keys that were
@@ -216,6 +217,14 @@ const flowkeyCommand = new SlashCommandBuilder()
             .addUserOption((opt) => opt.setName("user").setDescription("The user to renew").setRequired(true))
     )
     .addSubcommand((sub) => sub.setName("stats").setDescription("Show aggregate key statistics"))
+    .addSubcommand((sub) =>
+        sub
+            .setName("message")
+            .setDescription("Send a custom DM to a user, optionally with a file attached")
+            .addUserOption((opt) => opt.setName("user").setDescription("The user to message").setRequired(true))
+            .addStringOption((opt) => opt.setName("message").setDescription("The message to send").setRequired(true))
+            .addAttachmentOption((opt) => opt.setName("file").setDescription("Optional file to attach").setRequired(false))
+    )
     .addSubcommand((sub) => sub.setName("help").setDescription("Shows instructions for enabling DMs (postable in support tickets)"));
 
 async function registerCommands() {
@@ -485,6 +494,29 @@ client.on("interactionCreate", async (interaction) => {
                 `Unused (never activated): ${data.unused}\n` +
                 `Expired: ${data.expired}\n` +
                 `Revoked: ${data.revoked}`
+            );
+        }
+
+        if (sub === "message") {
+            const targetUser = interaction.options.getUser("user", true);
+            const messageText = interaction.options.getString("message", true);
+            const attachment = interaction.options.getAttachment("file", false);
+
+            const dmPayload = attachment
+                ? { content: messageText, files: [attachment.url] }
+                : messageText;
+
+            const dmSent = await dmUser(targetUser, dmPayload);
+
+            auditLog(
+                `✉️ **Message** - ${interaction.user} sent a custom DM to ${targetUser}` +
+                (attachment ? ` with attachment \`${attachment.name}\`` : "")
+            );
+
+            return interaction.editReply(
+                `${dmSent ? "✅" : "❌"} Message ${dmSent ? "sent to" : "failed to send to"} ${targetUser}` +
+                (attachment ? ` (attachment: \`${attachment.name}\`)` : "") +
+                (dmSent ? "" : "\nUser has DMs closed - use /flowkey help in this channel to guide them.")
             );
         }
 
